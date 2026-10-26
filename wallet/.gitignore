@@ -1,0 +1,8 @@
+build/
+dependencies.lock
+sdkconfig.old
+
+.vscode/
+.idea/
+*.swp
+.DS_Store

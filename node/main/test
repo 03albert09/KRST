@@ -1,0 +1,389 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "lwip/sockets.h"
+#include "mbedtls/ecdsa.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/platform_util.h"
+#include "esp_random.h"
+
+static const char *TAG = "NODE";
+
+// =========================================================================
+// KONFIGURACJA SIECI P2P
+// =========================================================================
+#define P2P_PORT       8333
+#define MAGIC_BYTES    0xF1B9
+
+#define MAX_ACTIVE_PEERS 8     
+#define MAX_INBOUND_PEERS 5     
+#define MAX_KNOWN_PEERS 20      
+
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+
+typedef enum {
+    CMD_HELLO = 1,
+    CMD_GETADDR,
+    CMD_ADDR,
+    CMD_NEW_BLOCK,
+    CMD_TX
+} p2p_cmd_t;
+
+typedef struct __attribute__((packed)) {
+    uint16_t magic;
+    uint16_t cmd;
+    uint32_t length;
+} p2p_header_t;
+
+typedef struct {
+    int socket;
+    char ip_address[16];
+    bool is_active;
+    bool is_inbound;       
+    bool is_authenticated; 
+} peer_connection_t;
+
+typedef struct {
+    char ip_address[16];
+    uint32_t last_seen_ticks;
+} known_peer_t;
+
+peer_connection_t active_peers[MAX_ACTIVE_PEERS];
+known_peer_t known_peers[MAX_KNOWN_PEERS];
+int known_peers_count = 0;
+
+mbedtls_ecdsa_context ecdsa_ctx;
+
+// =========================================================================
+// LOGIKA SIECIOWA (WIFI & TCP P2P)
+// =========================================================================
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "Rozlaczono z WiFi.");
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "IP Wezla: " IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+void wifi_init_basic(void) {
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+}
+
+void init_node_identity(void) {
+    nvs_handle_t nvs_handle;
+    uint8_t seed[32];
+    size_t seed_len = sizeof(seed);
+    
+    ESP_ERROR_CHECK(nvs_open("storage", NVS_READWRITE, &nvs_handle));
+    if (nvs_get_blob(nvs_handle, "node_seed", seed, &seed_len) != ESP_OK) {
+        esp_fill_random(seed, sizeof(seed)); 
+        nvs_set_blob(nvs_handle, "node_seed", seed, sizeof(seed));
+        nvs_commit(nvs_handle);
+    }
+    nvs_close(nvs_handle);
+
+    mbedtls_ecdsa_init(&ecdsa_ctx);
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context ctr_drbg;
+    mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+    mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, seed, sizeof(seed));
+    mbedtls_ecdsa_genkey(&ecdsa_ctx, MBEDTLS_ECP_DP_SECP256K1, mbedtls_ctr_drbg_random, &ctr_drbg);
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_entropy_free(&entropy);
+}
+
+bool is_ip_already_connected(const char* ip) {
+    for(int i = 0; i < MAX_ACTIVE_PEERS; i++) {
+        if (active_peers[i].is_active && strcmp(active_peers[i].ip_address, ip) == 0) return true;
+    }
+    return false;
+}
+
+void register_known_peer(const char* ip) {
+    for(int i = 0; i < known_peers_count; i++) {
+        if(strcmp(known_peers[i].ip_address, ip) == 0) {
+            known_peers[i].last_seen_ticks = xTaskGetTickCount();
+            return;
+        }
+    }
+    if (known_peers_count < MAX_KNOWN_PEERS) {
+        strncpy(known_peers[known_peers_count].ip_address, ip, 15);
+        known_peers[known_peers_count].last_seen_ticks = xTaskGetTickCount();
+        known_peers_count++;
+    }
+}
+
+void peer_rx_task(void *pvParameters) {
+    int peer_index = (int)pvParameters;
+    int sock = active_peers[peer_index].socket;
+    p2p_header_t header;
+
+    while (1) {
+        int len = recv(sock, &header, sizeof(p2p_header_t), 0);
+        if (len <= 0 || header.magic != MAGIC_BYTES) break;
+
+        if (header.cmd == CMD_HELLO) {
+            active_peers[peer_index].is_authenticated = true;
+            register_known_peer(active_peers[peer_index].ip_address);
+        } else if (header.cmd == CMD_NEW_BLOCK) {
+            ESP_LOGI(TAG, "Nowy blok od %s", active_peers[peer_index].ip_address);
+        }
+    }
+    close(sock);
+    active_peers[peer_index].is_active = false;
+    vTaskDelete(NULL);
+}
+
+void connect_to_peer(const char* target_ip) {
+    if (is_ip_already_connected(target_ip)) return;
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    struct sockaddr_in dest_addr = { .sin_family = AF_INET, .sin_port = htons(P2P_PORT) };
+    inet_pton(AF_INET, target_ip, &dest_addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) == 0) {
+        for(int i = 0; i < MAX_ACTIVE_PEERS; i++) {
+            if (!active_peers[i].is_active) {
+                active_peers[i].socket = sock;
+                active_peers[i].is_active = true;
+                active_peers[i].is_inbound = false;
+                active_peers[i].is_authenticated = true; 
+                strncpy(active_peers[i].ip_address, target_ip, 15);
+                
+                p2p_header_t hello = { .magic = MAGIC_BYTES, .cmd = CMD_HELLO, .length = 0 };
+                send(sock, &hello, sizeof(hello), 0);
+                xTaskCreate(peer_rx_task, "peer_rx", 4096, (void*)i, 5, NULL);
+                break;
+            }
+        }
+    } else {
+        close(sock);
+    }
+}
+
+void p2p_server_task(void *pvParameters) {
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    
+    int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    struct sockaddr_in server_addr = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_ANY), .sin_port = htons(P2P_PORT) };
+    bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
+    listen(listen_sock, 5);
+
+    while (1) {
+        struct sockaddr_in source_addr;
+        socklen_t addr_len = sizeof(source_addr);
+        int sock = accept(listen_sock, (struct sockaddr *)&source_addr, &addr_len);
+        
+        if (sock >= 0) {
+            char client_ip[16];
+            inet_ntoa_r(source_addr.sin_addr, client_ip, sizeof(client_ip));
+            
+            int inbound = 0;
+            for(int i = 0; i < MAX_ACTIVE_PEERS; i++) {
+                if (active_peers[i].is_active && active_peers[i].is_inbound) inbound++;
+            }
+
+            if (inbound >= MAX_INBOUND_PEERS || is_ip_already_connected(client_ip)) {
+                close(sock);
+                continue;
+            }
+
+            for(int i = 0; i < MAX_ACTIVE_PEERS; i++) {
+                if (!active_peers[i].is_active) {
+                    active_peers[i].socket = sock;
+                    active_peers[i].is_active = true;
+                    active_peers[i].is_inbound = true;
+                    active_peers[i].is_authenticated = false;
+                    strncpy(active_peers[i].ip_address, client_ip, 15);
+                    xTaskCreate(peer_rx_task, "peer_rx", 4096, (void*)i, 5, NULL);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void p2p_network_task(void *pvParameters) {
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    
+    while (1) {
+        int outbound_count = 0;
+        for(int i = 0; i < MAX_ACTIVE_PEERS; i++) {
+            if (active_peers[i].is_active && !active_peers[i].is_inbound) outbound_count++;
+        }
+        if (outbound_count < (MAX_ACTIVE_PEERS - MAX_INBOUND_PEERS) && known_peers_count > 0) {
+            int random_index = esp_random() % known_peers_count;
+            connect_to_peer(known_peers[random_index].ip_address);
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+// =========================================================================
+// INTERFEJS CLI WĘZŁA (Używa Twojej funkcji uart_read_line)
+// =========================================================================
+static void uart_read_line(char *buf, size_t max_len) {
+    size_t idx = 0;
+    while (1) {
+        int c = fgetc(stdin);
+        if (c == EOF) {
+            vTaskDelay(pdMS_TO_TICKS(15));
+            continue;
+        }
+        if (c == '\r' || c == '\n') {
+            printf("\r\n");
+            fflush(stdout);
+            buf[idx] = '\0';
+            return;
+        }
+        if (c == 0x08 || c == 0x7F) {
+            if (idx > 0) {
+                idx--;
+                printf("\b \b");
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (isprint(c) && (idx + 1 < max_len)) {
+            buf[idx++] = (char)c;
+            putchar(c);
+            fflush(stdout);
+        }
+    }
+}
+
+static void cmd_wifi(char *args) {
+    char *ssid = strtok(args, " ");
+    char *pass = strtok(NULL, ""); 
+
+    if (!ssid || !pass) {
+        printf("[BLAD] Uzycie: wifi [ssid] [haslo]\r\n");
+        return;
+    }
+    
+    printf("Laczenie z siecia: %s...\r\n", ssid);
+    wifi_config_t wifi_config = {0};
+    strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password) - 1);
+    
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+static void cmd_connect(char *args) {
+    char *ip = strtok(args, " ");
+    if (!ip) {
+        printf("[BLAD] Uzycie: connect [adres_IP]\r\n");
+        return;
+    }
+    
+    register_known_peer(ip);
+    connect_to_peer(ip);
+    printf("[OK] Rozpoczeto probe polaczenia z: %s\r\n", ip);
+}
+
+static void cmd_status(void) {
+    printf("\r\n--- STATUS WEZLA P2P ---\r\n");
+    int count = 0;
+    for (int i = 0; i < MAX_ACTIVE_PEERS; i++) {
+        if (active_peers[i].is_active) {
+            printf("  [%d] %s (%s) %s\r\n", 
+                i, active_peers[i].ip_address, 
+                active_peers[i].is_inbound ? "IN" : "OUT",
+                active_peers[i].is_authenticated ? "[OK]" : "[WAIT]");
+            count++;
+        }
+    }
+    if (count == 0) printf("  Brak polaczonych wezlow.\r\n");
+    printf("Znane wezly (Routing): %d\r\n", known_peers_count);
+    printf("------------------------\r\n");
+}
+
+static void node_cli_task(void *pvParameters) {
+    char line[128];
+
+    printf("\r\n====================================================================\r\n");
+    printf("  NODE P2P CLI (Stateless)\r\n");
+    printf("  1) wifi [ssid] [haslo]\r\n");
+    printf("  2) connect [IP]\r\n");
+    printf("  3) status\r\n");
+    printf("====================================================================\r\n");
+
+    while (1) {
+        printf("node> ");
+        fflush(stdout);
+        uart_read_line(line, sizeof(line));
+
+        if (strlen(line) == 0) continue;
+
+        if (strncmp(line, "wifi ", 5) == 0) {
+            cmd_wifi(line + 5);
+        } else if (strncmp(line, "connect ", 8) == 0) {
+            cmd_connect(line + 8);
+        } else if (strcmp(line, "status") == 0) {
+            cmd_status();
+        } else {
+            printf("Nieznana komenda. Dostepne: wifi, connect, status\r\n");
+        }
+
+        mbedtls_platform_zeroize(line, sizeof(line));
+    }
+}
+
+void node_cli_start(void) {
+    xTaskCreate(node_cli_task, "node_cli", 4096, NULL, 5, NULL);
+}
+
+// =========================================================================
+// ENTRY POINT
+// =========================================================================
+void app_main(void) {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    for(int i = 0; i < MAX_ACTIVE_PEERS; i++) active_peers[i].is_active = false;
+
+    init_node_identity();
+    wifi_init_basic();
+
+    xTaskCreate(p2p_server_task, "p2p_server", 4096, NULL, 5, NULL);
+    xTaskCreate(p2p_network_task, "p2p_network", 4096, NULL, 4, NULL);
+    
+    node_cli_start();
+
+    // Główny wątek śpi, cała praca dzieje się w asynchronicznych zadaniach
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
