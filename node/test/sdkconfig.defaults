@@ -1,0 +1,12 @@
+CONFIG_IDF_TARGET="esp32c3"
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions.csv"
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Testy kryptografii licza dlugo bez oddawania procesora
+CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# Asercje na wartosciach 64-bitowych: praca lancucha, kwoty
+CONFIG_UNITY_ENABLE_64BIT=y
+# Srednio 16 hashy na blok, zeby testy lancucha nie czekaly na kopanie
+CONFIG_KRST_POW_TARGET=0x10000000

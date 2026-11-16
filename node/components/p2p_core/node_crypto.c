@@ -1,4 +1,3 @@
-
 #include "node_crypto.h"
 #include <stdio.h>
 #include <string.h>
@@ -32,10 +31,8 @@ void node_crypto_init(void) {
     size_t priv_len = sizeof(priv_key);
     size_t pub_len = sizeof(s_my_pubkey);
 
-    // Próba odczytu zapisanej pary kluczy z NVS
     if (nvs_get_blob(nvs_handle, "node_priv", priv_key, &priv_len) == ESP_OK && priv_len == 32 &&
         nvs_get_blob(nvs_handle, "node_pub", s_my_pubkey, &pub_len) == ESP_OK && pub_len == 33) {
-
         mbedtls_mpi_read_binary(&s_ecdsa_ctx.d, priv_key, 32);
         mbedtls_ecp_point_read_binary(&s_ecdsa_ctx.grp, &s_ecdsa_ctx.Q, s_my_pubkey, 33);
         ESP_LOGI(TAG, "Wczytano tozsamosc z NVS.");
@@ -106,6 +103,20 @@ bool node_crypto_verify(const uint8_t pubkey[33], const uint8_t hash[32], const 
     mbedtls_mpi_free(&r);
     mbedtls_mpi_free(&s);
     return (ret == 0);
+}
+
+// Sprawdzenie, czy klucz publiczny jest punktem na krzywej
+bool node_crypto_is_valid_pubkey(const uint8_t pubkey[33]) {
+    mbedtls_ecp_point Q;
+    mbedtls_ecp_point_init(&Q);
+
+    int ret = mbedtls_ecp_point_read_binary(&s_ecdsa_ctx.grp, &Q, pubkey, 33);
+    if (ret == 0) {
+        ret = mbedtls_ecp_check_pubkey(&s_ecdsa_ctx.grp, &Q);
+    }
+
+    mbedtls_ecp_point_free(&Q);
+    return ret == 0;
 }
 
 // Obliczenie skrótu sesji handshake (Transcript)

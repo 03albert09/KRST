@@ -11,11 +11,11 @@
 
 typedef struct {
     char ip_address[16];
-    uint8_t public_key[33];          // Przypięty klucz publiczny (TOFU)
-    bool has_pubkey;                 // Czy klucz jest przypięty
-    TickType_t last_seen_ticks;      // Czas ostatniej aktywności
-    TickType_t cooldown_until_ticks; // Czas wygaśnięcia cooldownu
-    uint8_t failed_attempts;         // Liczba nieudanych prób połączenia (>=3: blokada auto-connect)
+    uint8_t public_key[33];
+    bool has_pubkey;
+    TickType_t last_seen_ticks;
+    TickType_t cooldown_until_ticks;
+    uint8_t failed_attempts;
 } known_peer_t;
 
 void peer_table_init(bool (*is_connected_fn)(const char *));
@@ -30,4 +30,4 @@ bool peer_table_find_candidate(char *out_ip, size_t max_len);
 uint32_t peer_table_serialize_addrs(char *out_buf, size_t max_bytes, const char *exclude_ip, uint16_t *out_count);
 void peer_table_print(void);
 
-#endif // PEER_TABLE_H
+#endif

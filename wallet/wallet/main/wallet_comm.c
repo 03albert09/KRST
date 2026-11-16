@@ -26,11 +26,16 @@ esp_err_t wallet_comm_send_tx(const wallet_transaction_t *tx, const char *target
     printf("\r\n=================== [WYSYLKA PAKIETU IP] ===================\r\n");
     printf("  Docelowy adres IP : %s\r\n", target_ip);
     printf("  Rozmiar pakietu   : %u B\r\n", (unsigned int)sizeof(wallet_transaction_t));
-    printf("  Nonce (licznik)   : %" PRIu32 "\r\n", tx->nonce);
-    printf("  Kwota transakcji  : %" PRIu64 "\r\n", tx->amount);
-    print_hex_line("  Nadawca (Pubkey)  : ", tx->sender_pubkey, WALLET_PUBKEY_SIZE);
-    print_hex_line("  Odbiorca (Pubkey) : ", tx->recipient_pubkey, WALLET_PUBKEY_SIZE);
-    print_hex_line("  Hash SHA-256      : ", tx->tx_hash, WALLET_HASH_SIZE);
+    uint32_t nonce = tx->nonce;
+    uint64_t amount = tx->amount;
+    uint8_t signing_hash[WALLET_HASH_SIZE];
+    krst_tx_signing_hash(tx, signing_hash);
+
+    printf("  Nonce (licznik)   : %" PRIu32 "\r\n", nonce);
+    printf("  Kwota transakcji  : %" PRIu64 "\r\n", amount);
+    print_hex_line("  Nadawca (Adres)   : ", tx->sender, WALLET_PUBKEY_SIZE);
+    print_hex_line("  Odbiorca (Adres)  : ", tx->recipient, WALLET_PUBKEY_SIZE);
+    print_hex_line("  Hash SHA-256      : ", signing_hash, WALLET_HASH_SIZE);
     print_hex_line("  Podpis ECDSA      : ", tx->signature, WALLET_SIG_SIZE);
     printf("============================================================\r\n");
 

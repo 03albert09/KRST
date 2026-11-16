@@ -4,17 +4,15 @@
 #include "nvs_flash.h"
 #include "esp_err.h"
 
-// Nasze moduły
 #include "node_wifi.h"
 #include "node_p2p.h"
 #include "node_cli.h"
+#include "chain.h"
+#include "chain_task.h"
+#include "chain_net.h"
 
+// Inicjalizacja NVS i uruchomienie łańcucha, WiFi, P2P oraz CLI
 void app_main(void) {
-    // 1. Wyłączenie buforowania sprzętowego z wejścia/wyjścia (naprawa timeoutów USB)
-    //setvbuf(stdin, NULL, _IONBF, 0);
-    //setvbuf(stdout, NULL, _IONBF, 0);
-
-    // 2. Inicjalizacja NVS (niezbędna dla WiFi oraz kluczy P2P)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -22,13 +20,34 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 3. Uruchomienie poszczególnych podsystemów
-    node_wifi_init();          // Warstwa sprzętowa WiFi
-    node_p2p_init();           // Kryptografia i struktury RAM
-    node_p2p_start_tasks();    // Wątki sieciowe TCP (czekają na WiFi)
-    node_cli_start();          // Wątek interfejsu UART/USB
+    ESP_ERROR_CHECK(chain_init());
 
-    // 4. RTOS Yield (Main Task odpoczywa, a tło pracuje)
+    chain_net_transport_t chain_transport = {
+        .send = node_p2p_send_to_peer,
+        .broadcast = node_p2p_broadcast,
+        .disconnect = node_p2p_disconnect,
+    };
+    chain_net_init(&chain_transport);
+
+    chain_task_config_t chain_config = {
+        .clock_synced = node_time_is_synced,
+        .on_result = chain_net_on_block_result,
+        .on_tick = chain_net_tick,
+    };
+    ESP_ERROR_CHECK(chain_task_start(&chain_config));
+
+    node_wifi_init();
+    node_p2p_init();
+
+    node_p2p_handlers_t p2p_handlers = {
+        .on_peer_authenticated = chain_net_on_peer_authenticated,
+        .on_message = chain_net_handle_message,
+    };
+    node_p2p_set_handlers(&p2p_handlers);
+
+    node_p2p_start_tasks();
+    node_cli_start();
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
     }

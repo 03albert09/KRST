@@ -82,22 +82,17 @@ static esp_err_t derive_pubkey_secp256k1(const uint8_t priv_key[WALLET_PRIVKEY_S
     if (ret == 0) ret = mbedtls_mpi_read_binary(&d, priv_key, WALLET_PRIVKEY_SIZE);
     if (ret == 0) ret = mbedtls_ecp_check_privkey(&grp, &d);
     
-    // Włączamy antenę Wi-Fi na czas operacji mnożenia ECC (TRNG blinding)
     wallet_trng_enable();
     if (ret == 0) ret = mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, wallet_trng_mbedtls_cb, NULL);
     wallet_trng_disable();
 
     if (ret == 0) {
-        uint8_t point_buf[65] = {0};
         size_t olen = 0;
-        ret = mbedtls_ecp_point_write_binary(&grp, &Q, MBEDTLS_ECP_PF_UNCOMPRESSED,
-                                             &olen, point_buf, sizeof(point_buf));
-        if (ret == 0 && olen == 65) {
-            memcpy(pub_key, point_buf + 1, WALLET_PUBKEY_SIZE);
-        } else {
+        ret = mbedtls_ecp_point_write_binary(&grp, &Q, MBEDTLS_ECP_PF_COMPRESSED,
+                                             &olen, pub_key, WALLET_PUBKEY_SIZE);
+        if (ret == 0 && olen != WALLET_PUBKEY_SIZE) {
             ret = -1;
         }
-        mbedtls_platform_zeroize(point_buf, sizeof(point_buf));
     }
 
     mbedtls_mpi_free(&d);
@@ -122,7 +117,6 @@ static esp_err_t sign_hash_secp256k1(const uint8_t priv_key[WALLET_PRIVKEY_SIZE]
     int ret = mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256K1);
     if (ret == 0) ret = mbedtls_mpi_read_binary(&d, priv_key, WALLET_PRIVKEY_SIZE);
 
-    // Włączamy antenę Wi-Fi na czas podpisu ECDSA (TRNG blinding)
     wallet_trng_enable();
     if (ret == 0) {
         ret = mbedtls_ecdsa_sign_det_ext(&grp, &r, &s, &d,
@@ -154,7 +148,6 @@ esp_err_t wallet_vault_import_keys(const uint8_t priv_key[WALLET_PRIVKEY_SIZE],
     memcpy(plain.priv_key, priv_key, WALLET_PRIVKEY_SIZE);
     memcpy(plain.pub_key, pub_key, WALLET_PUBKEY_SIZE);
 
-    // Włączamy antenę Wi-Fi do wylosowania wektora IV oraz soli PBKDF2
     wallet_trng_enable();
     wallet_trng_fill(blob.iv, IV_SIZE);
     wallet_trng_fill(blob.salt, SALT_SIZE);
@@ -187,12 +180,31 @@ esp_err_t wallet_vault_import_keys(const uint8_t priv_key[WALLET_PRIVKEY_SIZE],
     esp_err_t err = nvs_open("wallet", NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
         err = nvs_set_blob(nvs, "vault", &blob, sizeof(blob));
+        if (err == ESP_OK) err = nvs_set_blob(nvs, "address", pub_key, WALLET_PUBKEY_SIZE);
         nvs_set_u32(nvs, "nonce", 0);
         if (err == ESP_OK) err = nvs_commit(nvs);
         nvs_close(nvs);
     }
     mbedtls_platform_zeroize(&blob, sizeof(blob));
     return err;
+}
+
+// Odczyt publicznego adresu portfela bez hasla
+esp_err_t wallet_vault_get_address(uint8_t out_address[WALLET_PUBKEY_SIZE]) {
+    if (!out_address) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs;
+    if (nvs_open("wallet", NVS_READONLY, &nvs) != ESP_OK) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t size = WALLET_PUBKEY_SIZE;
+    esp_err_t err = nvs_get_blob(nvs, "address", out_address, &size);
+    nvs_close(nvs);
+
+    return (err == ESP_OK && size == WALLET_PUBKEY_SIZE) ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 // Utworzenie nowego portfela i zapis kluczy
@@ -312,7 +324,7 @@ esp_err_t wallet_vault_create_signed_tx(uint64_t amount,
     if (ret != 0) {
         nvs_close(nvs);
         mbedtls_platform_zeroize(&plain, sizeof(plain));
-        return ESP_ERR_INVALID_CRC; // Błędne hasło lub inny procesor!
+        return ESP_ERR_INVALID_CRC;
     }
 
     uint32_t nonce = 0;
@@ -323,15 +335,16 @@ esp_err_t wallet_vault_create_signed_tx(uint64_t amount,
     nvs_close(nvs);
 
     memset(out_tx, 0, sizeof(wallet_transaction_t));
+    out_tx->type = KRST_TX_TRANSFER;
     out_tx->nonce = nonce;
-    memcpy(out_tx->sender_pubkey, plain.pub_key, WALLET_PUBKEY_SIZE);
-    memcpy(out_tx->recipient_pubkey, recipient_pub, WALLET_PUBKEY_SIZE);
+    memcpy(out_tx->sender, plain.pub_key, WALLET_PUBKEY_SIZE);
+    memcpy(out_tx->recipient, recipient_pub, WALLET_PUBKEY_SIZE);
     out_tx->amount = amount;
 
-    size_t hashable_len = offsetof(wallet_transaction_t, tx_hash);
-    mbedtls_sha256((const unsigned char *)out_tx, hashable_len, out_tx->tx_hash, 0);
+    uint8_t signing_hash[WALLET_HASH_SIZE];
+    krst_tx_signing_hash(out_tx, signing_hash);
 
-    esp_err_t sign_err = sign_hash_secp256k1(plain.priv_key, out_tx->tx_hash, out_tx->signature);
+    esp_err_t sign_err = sign_hash_secp256k1(plain.priv_key, signing_hash, out_tx->signature);
     mbedtls_platform_zeroize(&plain, sizeof(plain));
 
     return sign_err;

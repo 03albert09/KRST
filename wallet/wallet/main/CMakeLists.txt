@@ -7,5 +7,5 @@ idf_component_register(
         "wallet_bip39.c"
         "wallet_trng.c"
     INCLUDE_DIRS "."
-    REQUIRES nvs_flash mbedtls efuse esp_hw_support esp_wifi esp_event esp_netif
+    REQUIRES krst_common nvs_flash mbedtls efuse esp_hw_support esp_wifi esp_event esp_netif
 )

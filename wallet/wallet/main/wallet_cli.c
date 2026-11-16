@@ -88,7 +88,7 @@ static void cmd_generate(char *args) {
     size_t args_len = strlen(args);
 
     char *pass_kw = strtok(args, " ");
-    char *password = strtok(NULL, ""); // Reszta linii to hasło (może zawierać spacje i znaki specjalne)
+    char *password = strtok(NULL, "");
 
     if (!pass_kw || strcmp(pass_kw, "pass") != 0 || !password || strlen(password) == 0) {
         printf("[BLAD] Uzycie: generate pass [haslo]\r\n");
@@ -211,6 +211,19 @@ static void cmd_recover(char *args) {
     mbedtls_platform_zeroize(pub, sizeof(pub));
 }
 
+// Obsluga komendy wyswietlenia adresu portfela
+static void cmd_address(void) {
+    uint8_t address[WALLET_PUBKEY_SIZE];
+    if (wallet_vault_get_address(address) != ESP_OK) {
+        printf("[BLAD] Brak adresu. Utworz portfel przez 'generate' albo odtworz go przez 'recover'.\r\n");
+        return;
+    }
+
+    printf("[OK] Adres portfela: ");
+    for (size_t i = 0; i < WALLET_PUBKEY_SIZE; i++) printf("%02X", address[i]);
+    printf("\r\n");
+}
+
 // Obsluga komendy podpisania i wysylki transakcji
 static void cmd_transfer(char *args) {
     if (!args) {
@@ -267,8 +280,9 @@ static void cmd_transfer(char *args) {
     }
 
     uint8_t recipient_pub[WALLET_PUBKEY_SIZE] = {0};
-    if (!hex_to_bytes(recipient_hex, recipient_pub, WALLET_PUBKEY_SIZE)) {
-        printf("[BLAD] Klucz publiczny odbiorcy [y] musi miec 64 znaki HEX (32 bajty).\r\n");
+    if (!hex_to_bytes(recipient_hex, recipient_pub, WALLET_PUBKEY_SIZE) ||
+        !krst_address_has_valid_prefix(recipient_pub)) {
+        printf("[BLAD] Adres odbiorcy [y] musi miec 66 znakow HEX (33 bajty) i zaczynac sie od 02 lub 03.\r\n");
         mbedtls_platform_zeroize(args, args_len);
         return;
     }
@@ -310,6 +324,7 @@ static void wallet_cli_task(void *pvParameters) {
     printf("   1) generate pass [haslo]                      - tworzy klucze i 12 slow kopii zapasowej\r\n");
     printf("   2) recover pass [haslo] words [12 slow]       - odzyskuje portfel z 12 slow mnemonika\r\n");
     printf("   3) transfer [x] to [y] ip [IP] pass [haslo]   - podpisuje i wysyla na adres IP\r\n");
+    printf("   4) address                                    - wyswietla adres portfela\r\n");
     printf("====================================================================\r\n");
 
     while (1) {
@@ -326,8 +341,10 @@ static void wallet_cli_task(void *pvParameters) {
                 cmd_recover(line + 8);
             } else if (strncmp(line, "transfer ", 9) == 0) {
                 cmd_transfer(line + 9);
+            } else if (strcmp(line, "address") == 0) {
+                cmd_address();
             } else {
-                printf("Nieznana komenda. Dostepne: generate, recover, transfer\r\n");
+                printf("Nieznana komenda. Dostepne: generate, recover, transfer, address\r\n");
             }
         }
 

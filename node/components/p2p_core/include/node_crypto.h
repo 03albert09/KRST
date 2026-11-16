@@ -14,6 +14,8 @@ bool node_crypto_sign(const uint8_t hash[32], uint8_t out_sig[64]);
 
 bool node_crypto_verify(const uint8_t pubkey[33], const uint8_t hash[32], const uint8_t sig[64]);
 
+bool node_crypto_is_valid_pubkey(const uint8_t pubkey[33]);
+
 void node_crypto_compute_handshake_hash(const uint8_t chal_a[32], const uint8_t chal_b[32],
                                         const uint8_t pk_a[33], const uint8_t pk_b[33],
                                         uint8_t out_hash[32]);
@@ -37,4 +39,4 @@ bool node_crypto_verify_msg_hmac(const uint8_t session_key[32],
 
 void node_crypto_bin_to_hex(const uint8_t *data, size_t data_len, char *out_hex, size_t max_len);
 
-#endif // NODE_CRYPTO_H
+#endif

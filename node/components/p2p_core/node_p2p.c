@@ -6,50 +6,49 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_system.h"
 #include "lwip/sockets.h"
+#include "mbedtls/platform_util.h"
 
 static const char *TAG = "NODE_P2P";
 
-
 typedef struct {
-    int socket;
+    uint32_t conn_id;
     char ip_address[16];
     uint8_t peer_pubkey[33];
     bool is_active;
-    bool is_inbound;       
-    bool is_authenticated; 
+    bool is_inbound;
     TickType_t last_rx_ticks;
     TickType_t last_ping_ticks;
-    uint8_t local_challenge[32];   
-    uint8_t remote_challenge[32];  
-    uint8_t session_key[32];       
-    uint32_t tx_seq;               
-    uint32_t rx_seq;              
+    uint8_t local_challenge[32];
+    uint8_t remote_challenge[32];
+    uint32_t rx_seq;
 } peer_connection_t;
 
 static peer_connection_t active_peers[MAX_ACTIVE_PEERS];
 
-// Event Group kontrolujący stan WiFi
+static p2p_channel_t s_channels[MAX_ACTIVE_PEERS];
+
+static SemaphoreHandle_t s_peers_mutex;
+static uint32_t s_next_conn_id = 1;
+
 static EventGroupHandle_t s_p2p_event_group;
 #define P2P_WIFI_READY_BIT BIT0
 
-// Rozmiar stosu zadania odbiorczego (zapas na obliczenia mbedTLS)
 #define PEER_RX_STACK_SIZE 6144
 
-// Uchwyt zadania zarządzania siecią P2P (do natychmiastowego wybudzania)
 static TaskHandle_t s_network_task_handle = NULL;
 
+static node_p2p_handlers_t s_handlers = { 0 };
 
-// Sprawdzenie obecności aktywnego połączenia z IP
-bool is_ip_already_connected(const char* ip) {
-    if (!ip) return false;
+// Sprawdzenie obecności połączenia z IP (wymaga s_peers_mutex)
+static bool is_ip_connected_locked(const char *ip) {
     for (int i = 0; i < MAX_ACTIVE_PEERS; i++) {
         if (active_peers[i].is_active && strcmp(active_peers[i].ip_address, ip) == 0) {
             return true;
@@ -58,8 +57,8 @@ bool is_ip_already_connected(const char* ip) {
     return false;
 }
 
-// Zliczanie aktywnych połączeń danego typu
-static int count_peers(bool inbound) {
+// Zliczanie aktywnych połączeń danego typu (wymaga s_peers_mutex)
+static int count_peers_locked(bool inbound) {
     int count = 0;
     for (int i = 0; i < MAX_ACTIVE_PEERS; i++) {
         if (active_peers[i].is_active && active_peers[i].is_inbound == inbound) {
@@ -69,41 +68,74 @@ static int count_peers(bool inbound) {
     return count;
 }
 
-// Alokacja i inicjalizacja nowego slotu połączenia
-static int allocate_peer_slot(int sock, const char *ip, bool is_inbound) {
-    for (int i = 0; i < MAX_ACTIVE_PEERS; i++) {
-        if (!active_peers[i].is_active) {
-            memset(&active_peers[i], 0, sizeof(peer_connection_t));
-            active_peers[i].socket = sock;
-            active_peers[i].is_active = true;
-            active_peers[i].is_inbound = is_inbound;
-            strncpy(active_peers[i].ip_address, ip, 15);
-            active_peers[i].last_rx_ticks = xTaskGetTickCount();
-            active_peers[i].last_ping_ticks = xTaskGetTickCount();
-            active_peers[i].tx_seq = 1;
-            active_peers[i].rx_seq = 1;
-            return i;
-        }
-    }
-    return -1;
+// Sprawdzenie obecności aktywnego połączenia z IP
+bool is_ip_already_connected(const char* ip) {
+    if (!ip) return false;
+    xSemaphoreTake(s_peers_mutex, portMAX_DELAY);
+    bool connected = is_ip_connected_locked(ip);
+    xSemaphoreGive(s_peers_mutex);
+    return connected;
 }
 
-// Bezpieczne wysłanie ramki z HMAC
+// Zliczanie aktywnych połączeń danego typu
+static int count_peers(bool inbound) {
+    xSemaphoreTake(s_peers_mutex, portMAX_DELAY);
+    int count = count_peers_locked(inbound);
+    xSemaphoreGive(s_peers_mutex);
+    return count;
+}
+
+// Alokacja slotu połączenia. Limit przychodzących i duplikat IP są sprawdzane razem z przydziałem.
+static int allocate_peer_slot(int sock, const char *ip, bool is_inbound) {
+    int slot = -1;
+    xSemaphoreTake(s_peers_mutex, portMAX_DELAY);
+
+    bool limit_reached = is_inbound && count_peers_locked(true) >= MAX_INBOUND_PEERS;
+    if (!limit_reached && !is_ip_connected_locked(ip)) {
+        for (int i = 0; i < MAX_ACTIVE_PEERS; i++) {
+            if (!active_peers[i].is_active) {
+                slot = i;
+                break;
+            }
+        }
+    }
+
+    if (slot >= 0) {
+        peer_connection_t *peer = &active_peers[slot];
+        memset(peer, 0, sizeof(peer_connection_t));
+
+        uint32_t conn_id = s_next_conn_id++;
+        if (conn_id == 0) conn_id = s_next_conn_id++;
+        peer->conn_id = conn_id;
+        peer->is_inbound = is_inbound;
+        strncpy(peer->ip_address, ip, sizeof(peer->ip_address) - 1);
+        peer->last_rx_ticks = xTaskGetTickCount();
+        peer->last_ping_ticks = peer->last_rx_ticks;
+        peer->rx_seq = 1;
+
+        p2p_channel_open(&s_channels[slot], sock, conn_id);
+        peer->is_active = true;
+    }
+
+    xSemaphoreGive(s_peers_mutex);
+    return slot;
+}
+
+// Wysłanie ramki przez właściciela slotu (zadanie RX lub kod przed jego startem)
 static bool peer_send(int peer_idx, p2p_cmd_t cmd, const void *payload, uint32_t payload_len) {
-    if (peer_idx < 0 || peer_idx >= MAX_ACTIVE_PEERS || !active_peers[peer_idx].is_active) {
+    if (peer_idx < 0 || peer_idx >= MAX_ACTIVE_PEERS) {
         return false;
     }
-    int sock = active_peers[peer_idx].socket;
-    const uint8_t *skey = active_peers[peer_idx].is_authenticated ? active_peers[peer_idx].session_key : NULL;
-    uint32_t seq = active_peers[peer_idx].is_authenticated ? active_peers[peer_idx].tx_seq++ : 0;
-    return p2p_send_msg(sock, cmd, payload, payload_len, skey, seq);
+    return p2p_channel_send(&s_channels[peer_idx], active_peers[peer_idx].conn_id, cmd, payload, payload_len);
 }
 
 // Czyszczenie slotu i nałożenie cooldownu
 static void peer_disconnect_cleanup(int peer_idx, const char *peer_ip) {
-    close(active_peers[peer_idx].socket);
+    p2p_channel_close(&s_channels[peer_idx]);
+
+    xSemaphoreTake(s_peers_mutex, portMAX_DELAY);
     memset(&active_peers[peer_idx], 0, sizeof(peer_connection_t));
-    active_peers[peer_idx].socket = -1;
+    xSemaphoreGive(s_peers_mutex);
 
     peer_table_set_cooldown(peer_ip, P2P_RECONNECT_COOLDOWN_SEC);
     ESP_LOGI(TAG, "Zwolniono slot [%d] po %s.", peer_idx, peer_ip);
@@ -112,7 +144,6 @@ static void peer_disconnect_cleanup(int peer_idx, const char *peer_ip) {
         xTaskNotifyGive(s_network_task_handle);
     }
 }
-
 
 // Finalizacja handshake ECDH oraz aktywacja sesji
 static bool finalize_handshake(int peer_idx, const char *peer_ip,
@@ -124,21 +155,28 @@ static bool finalize_handshake(int peer_idx, const char *peer_ip,
         return false;
     }
 
-    node_crypto_derive_session_key(shared_secret, chal_a, chal_b, active_peers[peer_idx].session_key);
+    uint8_t session_key[32];
+    node_crypto_derive_session_key(shared_secret, chal_a, chal_b, session_key);
+    mbedtls_platform_zeroize(shared_secret, sizeof(shared_secret));
 
-    active_peers[peer_idx].tx_seq = 1;
     active_peers[peer_idx].rx_seq = 1;
-    active_peers[peer_idx].is_authenticated = true;
+    p2p_channel_set_session_key(&s_channels[peer_idx], session_key);
     peer_table_mark_connected(peer_ip, peer_pubkey);
 
     char node_id_hex[18];
     node_crypto_bin_to_hex(peer_pubkey, 33, node_id_hex, 11);
     char sk_hex[18];
-    node_crypto_bin_to_hex(active_peers[peer_idx].session_key, 32, sk_hex, 11);
+    node_crypto_bin_to_hex(session_key, 32, sk_hex, 11);
+    mbedtls_platform_zeroize(session_key, sizeof(session_key));
     ESP_LOGI(TAG, "[AUTH OK] Wzajemna autentykacja z %s (Node ID: %s...) | Sesja: %s...",
              peer_ip, node_id_hex, sk_hex);
 
     peer_send(peer_idx, CMD_GETADDR, NULL, 0);
+
+    if (s_handlers.on_peer_authenticated != NULL) {
+        p2p_peer_ref_t peer = { .slot = (int8_t)peer_idx, .conn_id = active_peers[peer_idx].conn_id };
+        s_handlers.on_peer_authenticated(peer);
+    }
     return true;
 }
 
@@ -174,7 +212,7 @@ static bool handle_rx_hello(int peer_idx, const char *peer_ip, const void *paylo
     memcpy(ack.pubkey, my_pubkey, 33);
     memcpy(ack.signature, sig_b, 64);
 
-    if (!p2p_send_msg(active_peers[peer_idx].socket, CMD_HELLO_ACK, &ack, sizeof(ack), NULL, 0)) {
+    if (!peer_send(peer_idx, CMD_HELLO_ACK, &ack, sizeof(ack))) {
         return false;
     }
 
@@ -215,7 +253,7 @@ static bool handle_rx_hello_ack(int peer_idx, const char *peer_ip, const void *p
 
     p2p_msg_auth_confirm_t confirm;
     memcpy(confirm.signature, sig_a, 64);
-    if (!p2p_send_msg(active_peers[peer_idx].socket, CMD_AUTH_CONFIRM, &confirm, sizeof(confirm), NULL, 0)) {
+    if (!peer_send(peer_idx, CMD_AUTH_CONFIRM, &confirm, sizeof(confirm))) {
         return false;
     }
 
@@ -253,7 +291,7 @@ static bool handle_rx_auth_confirm(int peer_idx, const char *peer_ip, const void
 
 // Odesłanie listy znanych adresów GETADDR
 static bool handle_rx_getaddr(int peer_idx, const char *peer_ip) {
-    if (!active_peers[peer_idx].is_authenticated) return false;
+    if (!s_channels[peer_idx].authenticated) return false;
 
     char payload[sizeof(uint16_t) + MAX_KNOWN_PEERS * sizeof(p2p_addr_entry_t)];
     uint16_t count = 0;
@@ -302,7 +340,7 @@ static bool handle_rx_addr(int peer_idx, const char *peer_ip, const void *payloa
 // Pętla odbioru, weryfikacji ramek i pingowania
 static void peer_rx_task(void *pvParameters) {
     int peer_idx = (int)(intptr_t)pvParameters;
-    int sock = active_peers[peer_idx].socket;
+    int sock = s_channels[peer_idx].sock;
     char peer_ip[16];
     strncpy(peer_ip, active_peers[peer_idx].ip_address, sizeof(peer_ip));
     peer_ip[15] = '\0';
@@ -320,13 +358,18 @@ static void peer_rx_task(void *pvParameters) {
     }
 
     while (1) {
+        if (p2p_channel_is_broken(&s_channels[peer_idx])) {
+            ESP_LOGW(TAG, "Strumien nadawczy do %s jest uszkodzony. Rozlaczanie.", peer_ip);
+            break;
+        }
+
         p2p_header_t header;
-        int len = recv(sock, &header, sizeof(p2p_header_t), 0);
+        p2p_recv_status_t recv_status = p2p_recv_header(sock, &header);
         TickType_t now = xTaskGetTickCount();
 
-        if (len > 0) {
-            if (len != sizeof(p2p_header_t) || header.magic != MAGIC_BYTES) {
-                ESP_LOGW(TAG, "Nieprawidlowy naglowek od %s (len=%d, magic=0x%04X)", peer_ip, len, header.magic);
+        if (recv_status == P2P_RECV_OK) {
+            if (header.magic != MAGIC_BYTES) {
+                ESP_LOGW(TAG, "Nieprawidlowy naglowek od %s (magic=0x%04X)", peer_ip, header.magic);
                 break;
             }
 
@@ -346,22 +389,19 @@ static void peer_rx_task(void *pvParameters) {
                 }
             }
 
-            // KRYPTOGRAFICZNA WERYFIKACJA CAŁEJ KOMUNIKACJI (OBRONA PRZED MITM I REPLAY)
-            if (active_peers[peer_idx].is_authenticated) {
+            if (s_channels[peer_idx].authenticated) {
                 if (header.cmd == CMD_HELLO || header.cmd == CMD_HELLO_ACK || header.cmd == CMD_AUTH_CONFIRM) {
                     ESP_LOGW(TAG, "Odrzucono ponowny handshake od zalogowanego wezla %s", peer_ip);
                     break;
                 }
 
-                // 1. Weryfikacja numeru sekwencyjnego (Ochrona przed REPLAY ATTACK)
                 if (header.seq != active_peers[peer_idx].rx_seq) {
                     ESP_LOGE(TAG, "[MITM / REPLAY DETECTED] Niepoprawny nr sekwencji od %s! Oczekiwano %lu, odebrano %lu",
                              peer_ip, (unsigned long)active_peers[peer_idx].rx_seq, (unsigned long)header.seq);
                     break;
                 }
 
-                // 2. Weryfikacja HMAC kluczem sesji (Ochrona przed podmianą pakietów)
-                if (!node_crypto_verify_msg_hmac(active_peers[peer_idx].session_key,
+                if (!node_crypto_verify_msg_hmac(s_channels[peer_idx].session_key,
                                                  header.magic, header.cmd, header.length, header.seq,
                                                  header.length > 0 ? payload_buf : NULL, header.length,
                                                  header.hmac)) {
@@ -401,7 +441,12 @@ static void peer_rx_task(void *pvParameters) {
                     ok = true;
                     break;
                 default:
-                    ESP_LOGW(TAG, "Nieznana komenda %d od %s", header.cmd, peer_ip);
+                    if (s_handlers.on_message != NULL) {
+                        p2p_peer_ref_t peer = { .slot = (int8_t)peer_idx, .conn_id = active_peers[peer_idx].conn_id };
+                        ok = s_handlers.on_message(peer, header.cmd, payload_buf, header.length);
+                    } else {
+                        ESP_LOGW(TAG, "Nieznana komenda %d od %s", header.cmd, peer_ip);
+                    }
                     break;
             }
 
@@ -409,15 +454,12 @@ static void peer_rx_task(void *pvParameters) {
                 ESP_LOGW(TAG, "Blad przetwarzania komendy %d od %s. Rozlaczanie.", header.cmd, peer_ip);
                 break;
             }
-        } else if (len == 0) {
+        } else if (recv_status == P2P_RECV_CLOSED) {
             ESP_LOGI(TAG, "Wezel %s zamknal polaczenie", peer_ip);
             break;
-        } else {
-            int err = errno;
-            if (err != EAGAIN && err != EWOULDBLOCK) {
-                ESP_LOGW(TAG, "Blad gniazda dla %s (errno=%d)", peer_ip, err);
-                break;
-            }
+        } else if (recv_status == P2P_RECV_ERROR) {
+            ESP_LOGW(TAG, "Blad odbioru naglowka od %s", peer_ip);
+            break;
         }
 
         if (now - active_peers[peer_idx].last_ping_ticks >= pdMS_TO_TICKS(P2P_PING_INTERVAL_MS)) {
@@ -438,7 +480,6 @@ static void peer_rx_task(void *pvParameters) {
     peer_disconnect_cleanup(peer_idx, peer_ip);
     vTaskDelete(NULL);
 }
-
 
 // Nawiązanie wychodzącego połączenia TCP z węzłem
 void connect_to_peer(const char* target_ip) {
@@ -469,11 +510,15 @@ void connect_to_peer(const char* target_ip) {
             memcpy(hello.challenge, active_peers[slot].local_challenge, 32);
             node_crypto_get_pubkey(hello.pubkey);
 
-            p2p_send_msg(sock, CMD_HELLO, &hello, sizeof(hello), NULL, 0);
-            xTaskCreate(peer_rx_task, "peer_rx", PEER_RX_STACK_SIZE, (void*)(intptr_t)slot, 5, NULL);
+            peer_send(slot, CMD_HELLO, &hello, sizeof(hello));
+            if (xTaskCreate(peer_rx_task, "peer_rx", PEER_RX_STACK_SIZE, (void*)(intptr_t)slot, 5, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "Brak pamieci na zadanie odbiorcze dla %s", target_ip);
+                peer_disconnect_cleanup(slot, target_ip);
+                return;
+            }
             ESP_LOGI(TAG, "Polaczono z %s (slot [%d]), wyslano HELLO z wyzwaniem sesji", target_ip, slot);
         } else {
-            ESP_LOGW(TAG, "Brak wolnych slotow dla %s", target_ip);
+            ESP_LOGW(TAG, "Brak wolnego slotu albo juz polaczono z %s", target_ip);
             close(sock);
         }
     } else {
@@ -519,15 +564,14 @@ static void p2p_server_task(void *pvParameters) {
         char client_ip[16];
         inet_ntoa_r(source_addr.sin_addr, client_ip, sizeof(client_ip));
 
-        if (count_peers(true) >= MAX_INBOUND_PEERS || is_ip_already_connected(client_ip)) {
-            close(sock);
-            continue;
-        }
-
         int slot = allocate_peer_slot(sock, client_ip, true);
         if (slot >= 0) {
             peer_table_clear_cooldown(client_ip);
-            xTaskCreate(peer_rx_task, "peer_rx", PEER_RX_STACK_SIZE, (void*)(intptr_t)slot, 5, NULL);
+            if (xTaskCreate(peer_rx_task, "peer_rx", PEER_RX_STACK_SIZE, (void*)(intptr_t)slot, 5, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "Brak pamieci na zadanie odbiorcze dla %s", client_ip);
+                peer_disconnect_cleanup(slot, client_ip);
+                continue;
+            }
             ESP_LOGI(TAG, "Zaakceptowano polaczenie przychodzace od %s (slot [%d], oczekiwanie na handshake)", client_ip, slot);
         } else {
             close(sock);
@@ -574,9 +618,14 @@ static void p2p_network_task(void *pvParameters) {
 // Inicjalizacja struktur P2P, kryptografii i tablicy
 void node_p2p_init(void) {
     s_p2p_event_group = xEventGroupCreate();
+    s_peers_mutex = xSemaphoreCreateMutex();
+    configASSERT(s_peers_mutex != NULL);
+
     memset(active_peers, 0, sizeof(active_peers));
     for (int i = 0; i < MAX_ACTIVE_PEERS; i++) {
-        active_peers[i].socket = -1;
+        bool created = p2p_channel_create(&s_channels[i]);
+        configASSERT(created);
+        (void)created;
     }
 
     node_crypto_init();
@@ -598,15 +647,61 @@ void node_p2p_set_wifi_ready(bool is_ready) {
     }
 }
 
-// Wysłanie zapytania GETADDR do aktywnych węzłów
-void node_p2p_request_addresses(void) {
-    int sent = 0;
+// Ustawienie obsługi zdarzeń wyższej warstwy
+void node_p2p_set_handlers(const node_p2p_handlers_t *handlers) {
+    s_handlers = *handlers;
+}
+
+// Rozłączenie węzła z dowolnego zadania
+void node_p2p_disconnect(p2p_peer_ref_t peer) {
+    if (peer.slot >= 0 && peer.slot < MAX_ACTIVE_PEERS) {
+        p2p_channel_abort(&s_channels[peer.slot], peer.conn_id);
+    }
+}
+
+// Wysłanie ramki do uwierzytelnionego węzła z dowolnego zadania
+bool node_p2p_send_to_peer(p2p_peer_ref_t peer, p2p_cmd_t cmd, const void *payload, uint32_t payload_len) {
+    if (peer.slot < 0 || peer.slot >= MAX_ACTIVE_PEERS || peer.conn_id == 0) {
+        return false;
+    }
+
+    xSemaphoreTake(s_peers_mutex, portMAX_DELAY);
+    bool usable = active_peers[peer.slot].is_active &&
+                  active_peers[peer.slot].conn_id == peer.conn_id &&
+                  s_channels[peer.slot].authenticated;
+    xSemaphoreGive(s_peers_mutex);
+    if (!usable) return false;
+
+    return p2p_channel_send(&s_channels[peer.slot], peer.conn_id, cmd, payload, payload_len);
+}
+
+// Rozesłanie ramki do uwierzytelnionych węzłów
+int node_p2p_broadcast(p2p_cmd_t cmd, const void *payload, uint32_t payload_len, const p2p_peer_ref_t *exclude) {
+    p2p_peer_ref_t targets[MAX_ACTIVE_PEERS];
+    int target_count = 0;
+
+    xSemaphoreTake(s_peers_mutex, portMAX_DELAY);
     for (int i = 0; i < MAX_ACTIVE_PEERS; i++) {
-        if (active_peers[i].is_active && active_peers[i].is_authenticated && active_peers[i].socket >= 0) {
-            peer_send(i, CMD_GETADDR, NULL, 0);
+        if (!active_peers[i].is_active || !s_channels[i].authenticated) continue;
+        if (exclude && exclude->slot == i && exclude->conn_id == active_peers[i].conn_id) continue;
+        targets[target_count].slot = (int8_t)i;
+        targets[target_count].conn_id = active_peers[i].conn_id;
+        target_count++;
+    }
+    xSemaphoreGive(s_peers_mutex);
+
+    int sent = 0;
+    for (int i = 0; i < target_count; i++) {
+        if (p2p_channel_send(&s_channels[targets[i].slot], targets[i].conn_id, cmd, payload, payload_len)) {
             sent++;
         }
     }
+    return sent;
+}
+
+// Wysłanie zapytania GETADDR do aktywnych węzłów
+void node_p2p_request_addresses(void) {
+    int sent = node_p2p_broadcast(CMD_GETADDR, NULL, 0, NULL);
     printf("[P2P] Wyslano zapytanie CMD_GETADDR do %d uwierzytelnionych wezlow.\r\n", sent);
 }
 
@@ -627,15 +722,17 @@ void print_node_status(void) {
     int count = 0;
     TickType_t now = xTaskGetTickCount();
 
+    xSemaphoreTake(s_peers_mutex, portMAX_DELAY);
     for (int i = 0; i < MAX_ACTIVE_PEERS; i++) {
         if (active_peers[i].is_active) {
             uint32_t sec_since_rx = ((now - active_peers[i].last_rx_ticks) * portTICK_PERIOD_MS) / 1000;
             char peer_id[18] = "niezweryfikowany";
             char session_id[18] = "brak";
-            if (active_peers[i].is_authenticated) {
+            bool authenticated = s_channels[i].authenticated;
+            if (authenticated) {
                 node_crypto_bin_to_hex(active_peers[i].peer_pubkey, 33, peer_id, 11);
                 strcat(peer_id, "...");
-                node_crypto_bin_to_hex(active_peers[i].session_key, 32, session_id, 11);
+                node_crypto_bin_to_hex(s_channels[i].session_key, 32, session_id, 11);
                 strcat(session_id, "...");
             }
 
@@ -643,11 +740,12 @@ void print_node_status(void) {
                 i, active_peers[i].ip_address, 
                 peer_id, session_id,
                 active_peers[i].is_inbound ? "IN" : "OUT",
-                active_peers[i].is_authenticated ? "[OK]" : "[WAIT - HANDSHAKE]",
+                authenticated ? "[OK]" : "[WAIT - HANDSHAKE]",
                 (unsigned long)sec_since_rx);
             count++;
         }
     }
+    xSemaphoreGive(s_peers_mutex);
     if (count == 0) printf("  Brak aktywnych polaczen TCP.\r\n");
 
     peer_table_print();

@@ -4,12 +4,15 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_random.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "PEER_TABLE";
 
 static known_peer_t s_known_peers[MAX_KNOWN_PEERS];
 static int s_known_peers_count = 0;
 static bool (*s_is_connected_fn)(const char *) = NULL;
+
+static SemaphoreHandle_t s_table_mutex = NULL;
 
 // Sprawdzenie stanu połączenia z danym węzłem
 static bool is_peer_connected(const char *ip) {
@@ -65,15 +68,8 @@ static int find_or_create_peer_slot(const char *ip) {
     return slot;
 }
 
-// Inicjalizacja tablicy routingu oraz callbacku połączeń
-void peer_table_init(bool (*is_connected_fn)(const char *)) {
-    s_known_peers_count = 0;
-    s_is_connected_fn = is_connected_fn;
-    memset(s_known_peers, 0, sizeof(s_known_peers));
-}
-
 // Aktualizacja znacznika aktywności czasowej węzła
-void peer_table_touch(const char *ip) {
+static void touch_unlocked(const char *ip) {
     if (!ip) return;
     for (int i = 0; i < s_known_peers_count; i++) {
         if (strcmp(s_known_peers[i].ip_address, ip) == 0) {
@@ -84,7 +80,7 @@ void peer_table_touch(const char *ip) {
 }
 
 // Rejestracja węzła i klucza z plotki
-void peer_table_register_discovered_entry(const char *ip, const uint8_t pubkey[33]) {
+static void register_discovered_unlocked(const char *ip, const uint8_t pubkey[33]) {
     if (!ip || ip[0] == '\0') return;
 
     int slot = find_or_create_peer_slot(ip);
@@ -98,7 +94,7 @@ void peer_table_register_discovered_entry(const char *ip, const uint8_t pubkey[3
 }
 
 // Weryfikacja tożsamości lub przypięcie klucza
-bool peer_table_check_or_pin_key(const char *ip, const uint8_t pubkey[33]) {
+static bool check_or_pin_unlocked(const char *ip, const uint8_t pubkey[33]) {
     if (!ip || !pubkey) return false;
 
     for (int i = 0; i < s_known_peers_count; i++) {
@@ -132,7 +128,7 @@ bool peer_table_check_or_pin_key(const char *ip, const uint8_t pubkey[33]) {
 }
 
 // Oznaczenie węzła połączonym i reset błędów
-void peer_table_mark_connected(const char *ip, const uint8_t pubkey[33]) {
+static void mark_connected_unlocked(const char *ip, const uint8_t pubkey[33]) {
     if (!ip || ip[0] == '\0') return;
 
     int slot = find_or_create_peer_slot(ip);
@@ -148,7 +144,7 @@ void peer_table_mark_connected(const char *ip, const uint8_t pubkey[33]) {
 }
 
 // Inkrementacja licznika błędów i nałożenie cooldownu
-void peer_table_on_connect_failed(const char *ip, uint32_t base_seconds) {
+static void on_connect_failed_unlocked(const char *ip, uint32_t base_seconds) {
     if (!ip) return;
 
     for (int i = 0; i < s_known_peers_count; i++) {
@@ -172,7 +168,7 @@ void peer_table_on_connect_failed(const char *ip, uint32_t base_seconds) {
 }
 
 // Nałożenie czasowego cooldownu z losowym rozrzutem
-void peer_table_set_cooldown(const char *ip, uint32_t base_seconds) {
+static void set_cooldown_unlocked(const char *ip, uint32_t base_seconds) {
     if (!ip) return;
 
     for (int i = 0; i < s_known_peers_count; i++) {
@@ -187,7 +183,7 @@ void peer_table_set_cooldown(const char *ip, uint32_t base_seconds) {
 }
 
 // Usunięcie blokady czasowej dla danego węzła
-void peer_table_clear_cooldown(const char *ip) {
+static void clear_cooldown_unlocked(const char *ip) {
     if (!ip) return;
 
     for (int i = 0; i < s_known_peers_count; i++) {
@@ -199,7 +195,7 @@ void peer_table_clear_cooldown(const char *ip) {
 }
 
 // Losowy wybór kandydata do połączenia wychodzącego
-bool peer_table_find_candidate(char *out_ip, size_t max_len) {
+static bool find_candidate_unlocked(char *out_ip, size_t max_len) {
     if (!out_ip || max_len == 0) return false;
 
     int candidates[MAX_KNOWN_PEERS];
@@ -230,7 +226,7 @@ bool peer_table_find_candidate(char *out_ip, size_t max_len) {
 }
 
 // Serializacja listy znanych węzłów do bufora
-uint32_t peer_table_serialize_addrs(char *out_buf, size_t max_bytes, const char *exclude_ip, uint16_t *out_count) {
+static uint32_t serialize_addrs_unlocked(char *out_buf, size_t max_bytes, const char *exclude_ip, uint16_t *out_count) {
     if (!out_buf || max_bytes < sizeof(uint16_t)) {
         if (out_count) *out_count = 0;
         return 0;
@@ -266,7 +262,7 @@ uint32_t peer_table_serialize_addrs(char *out_buf, size_t max_bytes, const char 
 }
 
 // Wyświetlenie zawartości tablicy routingu w CLI
-void peer_table_print(void) {
+static void print_unlocked(void) {
     printf("Tablica Routing (Gossip): %d/%d wezlow\r\n", s_known_peers_count, MAX_KNOWN_PEERS);
     TickType_t now = xTaskGetTickCount();
 
@@ -299,4 +295,91 @@ void peer_table_print(void) {
                    s_known_peers[i].failed_attempts, MAX_PEER_FAILED_ATTEMPTS, (unsigned long)age_sec);
         }
     }
+}
+
+// Inicjalizacja tablicy routingu oraz callbacku połączeń
+void peer_table_init(bool (*is_connected_fn)(const char *)) {
+    if (s_table_mutex == NULL) {
+        s_table_mutex = xSemaphoreCreateMutex();
+        configASSERT(s_table_mutex != NULL);
+    }
+
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    s_known_peers_count = 0;
+    s_is_connected_fn = is_connected_fn;
+    memset(s_known_peers, 0, sizeof(s_known_peers));
+    xSemaphoreGive(s_table_mutex);
+}
+
+// Aktualizacja znacznika aktywności węzła pod blokadą tablicy
+void peer_table_touch(const char *ip) {
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    touch_unlocked(ip);
+    xSemaphoreGive(s_table_mutex);
+}
+
+// Rejestracja węzła i klucza z plotki pod blokadą tablicy
+void peer_table_register_discovered_entry(const char *ip, const uint8_t pubkey[33]) {
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    register_discovered_unlocked(ip, pubkey);
+    xSemaphoreGive(s_table_mutex);
+}
+
+// Weryfikacja tożsamości lub przypięcie klucza pod blokadą tablicy
+bool peer_table_check_or_pin_key(const char *ip, const uint8_t pubkey[33]) {
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    bool ok = check_or_pin_unlocked(ip, pubkey);
+    xSemaphoreGive(s_table_mutex);
+    return ok;
+}
+
+// Oznaczenie węzła jako połączonego pod blokadą tablicy
+void peer_table_mark_connected(const char *ip, const uint8_t pubkey[33]) {
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    mark_connected_unlocked(ip, pubkey);
+    xSemaphoreGive(s_table_mutex);
+}
+
+// Zapis nieudanego połączenia i nałożenie cooldownu pod blokadą tablicy
+void peer_table_on_connect_failed(const char *ip, uint32_t base_seconds) {
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    on_connect_failed_unlocked(ip, base_seconds);
+    xSemaphoreGive(s_table_mutex);
+}
+
+// Nałożenie cooldownu na węzeł pod blokadą tablicy
+void peer_table_set_cooldown(const char *ip, uint32_t base_seconds) {
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    set_cooldown_unlocked(ip, base_seconds);
+    xSemaphoreGive(s_table_mutex);
+}
+
+// Usunięcie cooldownu węzła pod blokadą tablicy
+void peer_table_clear_cooldown(const char *ip) {
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    clear_cooldown_unlocked(ip);
+    xSemaphoreGive(s_table_mutex);
+}
+
+// Losowy wybór kandydata do połączenia pod blokadą tablicy
+bool peer_table_find_candidate(char *out_ip, size_t max_len) {
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    bool found = find_candidate_unlocked(out_ip, max_len);
+    xSemaphoreGive(s_table_mutex);
+    return found;
+}
+
+// Serializacja znanych węzłów do bufora pod blokadą tablicy
+uint32_t peer_table_serialize_addrs(char *out_buf, size_t max_bytes, const char *exclude_ip, uint16_t *out_count) {
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    uint32_t written = serialize_addrs_unlocked(out_buf, max_bytes, exclude_ip, out_count);
+    xSemaphoreGive(s_table_mutex);
+    return written;
+}
+
+// Wyświetlenie tablicy routingu pod blokadą
+void peer_table_print(void) {
+    xSemaphoreTake(s_table_mutex, portMAX_DELAY);
+    print_unlocked();
+    xSemaphoreGive(s_table_mutex);
 }

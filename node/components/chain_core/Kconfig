@@ -1,0 +1,13 @@
+menu "KRST"
+
+    config KRST_POW_TARGET
+        hex "Prog trudnosci PoW"
+        default 0x00002000
+        range 0x1 0xFFFFFFFF
+        help
+            Hash bloku jest poprawny, gdy jego pierwsze 4 bajty (big-endian) sa
+            mniejsze od tej wartosci. Srednia liczba hashy na blok to 2^32 / prog.
+            Wszystkie wezly w sieci musza miec te sama wartosc. Domyslna wartosc daje
+            okolo 31 s na blok przy jednym gorniku ESP32-C3 (zmierzone 17068 H/s).
+
+endmenu

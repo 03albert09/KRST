@@ -10,12 +10,12 @@ BINARIES = [
     (
         "0x10000",
         "build/node.bin",
-    ),  # <-- Pamiętaj o zmianie na nazwę swojego pliku .bin!
+    ),
 ]
 
 
+# Wgrywanie firmware na płytkę podłączoną do podanego portu
 def flash_port(port):
-  # Używamy oficjalnego launchera Windows "py -3", żeby ominąć zmienne środowiskowe VS Code
   cmd = [
       "py",
       "-3",
@@ -53,6 +53,7 @@ def flash_port(port):
     print(f"[{port}] Błąd wgrywania:\n{result.stderr}")
 
 
+# Równoległe wgrywanie na wszystkie porty
 def main():
   with concurrent.futures.ThreadPoolExecutor() as executor:
     list(executor.map(flash_port, PORTS))

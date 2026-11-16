@@ -1,0 +1,7 @@
+# Name,   Type, SubType, Offset,   Size
+# Uklad nvs i factory od adresu 0x10000 jak w poprzedniej tabeli, wiec klucze wezlow zostaja.
+nvs,      data, nvs,     0x9000,   0x6000
+phy_init, data, phy,     0xf000,   0x1000
+factory,  app,  factory, 0x10000,  0x130000
+# Dziennik blokow (768 KB). 0x40 to podtyp z zakresu przeznaczonego dla aplikacji.
+chain,    data, 0x40,    0x140000, 0xC0000
